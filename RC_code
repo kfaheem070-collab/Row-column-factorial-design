@@ -1,259 +1,507 @@
 """
-Row-Column Factorial Design with Asymmetric Factors
+Row-Column Factorial Design — Search-Based Program
 ====================================================
-Constructs a nrows × ncols array whose entries are tuples of factor levels such that:
+You specify:
+  - nrows, ncols  : dimensions of the array
+  - factor_levels : list of level counts per factor
+  - strength      : 1, 2, or 3
+  - time_limit    : seconds before giving up (default 120)
 
-  1. TREATMENT BALANCE      – each treatment tuple appears the same number of times
-  2. ROW MARGINAL BALANCE   – each level of each factor appears equally often in every row
-  3. COL MARGINAL BALANCE   – each level of each factor appears equally often in every column
-  4. STRENGTH-t             – for every t factor positions chosen together, each ordered
-                              t-tuple of levels appears equally often in every row AND
-                              in every column  (t = 2 or 3 as requested)
-
-Construction method: generalised cyclic array
-  cell(i,j)[f] = (row_coeff[f]*i + col_coeff[f]*j)  mod  q_f
-
-Divisibility requirements (auto-checked and explained):
-  - Strength 1 : q_f | nrows  and  q_f | ncols  for every factor f
-  - Strength 2 : additionally  q_f*q_g | nrows  and  q_f*q_g | ncols  for every pair f,g
-  - Strength 3 : additionally  q_f*q_g*q_h | nrows and ncols for every triple f,g,h
-
-Output: multi-sheet Excel workbook.
+The program searches via backtracking (row-by-row) for a valid design.
+It EITHER finds one and writes it to Excel, OR exhausts the search and tells
+you the design does not exist, OR reports a timeout if search space is too large.
 """
 
-import numpy as np
-import itertools
-from math import gcd
-from functools import reduce
-from collections import Counter
+import itertools, time, sys, random
+from collections import Counter, defaultdict
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 # ════════════════════════════════════════════════════════════════
-#  ▶  CONFIGURATION  ◀  – edit these four lines
+#  ▶  CONFIGURATION  ◀
 # ════════════════════════════════════════════════════════════════
-NUM_ROWS       = 16
-NUM_COLS       = 16
-FACTOR_LEVELS  = [4, 4, 2, 2]
-TARGET_STRENGTH = 2
-OUTPUT_FILE    = "/Users/fahimrahim/Downloads/Research_students/Hadia_batool/Claude_codes/design_16x16_4_4_2_2.xlsx"
+NROWS          = 8
+NCOLS          = 8
+FACTOR_LEVELS  = [4, 2, 2, 2]     # one entry per factor
+STRENGTH       = 2              # 1, 2, or 3
+TIME_LIMIT     = 6000            # seconds; set higher for exhaustive proof of non-existence
+FIND_ALL       = False          # True = keep searching after first solution
+OUTPUT_FILE    = "/Users/fahimrahim/Downloads/Research_students/Hadia_batool/Claude_codes/design_8x8_4_2_2_2_claude5.xlsx"
 # ════════════════════════════════════════════════════════════════
 
 
-# ── Maths helpers ────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
+#  Feasibility checks
+# ────────────────────────────────────────────────────────────────
 
-def lcm2(a, b): return a * b // gcd(a, b)
-def lcm_list(lst): return reduce(lcm2, lst)
+def feasibility_check(nrows, ncols, fl, strength):
+    """
+    Return (ok, list_of_reasons_why_infeasible).
+    Checks necessary divisibility conditions.
+    These are NECESSARY but not sufficient — a design may still not exist
+    even when these pass.
+    """
+    k = len(fl)
+    reasons = []
+    N = nrows * ncols
+    prod = 1
+    for q in fl: prod *= q
+    if N % prod != 0:
+        reasons.append(
+            f"nrows×ncols = {N} must be divisible by product of all levels "
+            f"({prod}) for treatment balance.")
 
-def required_divisors(factor_levels, strength):
-    """Return the set of integers that must divide nrows and ncols."""
-    k  = len(factor_levels)
-    divs = set(factor_levels)
+    for q in fl:
+        if ncols % q != 0:
+            reasons.append(f"ncols={ncols} must be divisible by {q} (row marginal balance).")
+        if nrows % q != 0:
+            reasons.append(f"nrows={nrows} must be divisible by {q} (column marginal balance).")
+
     if strength >= 2:
-        for i, j in itertools.combinations(range(k), 2):
-            divs.add(factor_levels[i] * factor_levels[j])
+        for f1, f2 in itertools.combinations(range(k), 2):
+            q1, q2 = fl[f1], fl[f2]
+            if ncols % (q1 * q2) != 0:
+                reasons.append(
+                    f"ncols={ncols} must be divisible by {q1}×{q2}={q1*q2} "
+                    f"(strength-2 row balance for factors {f1+1},{f2+1}).")
+            if nrows % (q1 * q2) != 0:
+                reasons.append(
+                    f"nrows={nrows} must be divisible by {q1}×{q2}={q1*q2} "
+                    f"(strength-2 column balance for factors {f1+1},{f2+1}).")
+
     if strength >= 3:
-        for i, j, kk in itertools.combinations(range(k), 3):
-            divs.add(factor_levels[i] * factor_levels[j] * factor_levels[kk])
-    return divs
+        for f1, f2, f3 in itertools.combinations(range(k), 3):
+            q1, q2, q3 = fl[f1], fl[f2], fl[f3]
+            prod3 = q1 * q2 * q3
+            if ncols % prod3 != 0:
+                reasons.append(
+                    f"ncols={ncols} must be divisible by {q1}×{q2}×{q3}={prod3} "
+                    f"(strength-3, factors {f1+1},{f2+1},{f3+1}).")
+            if nrows % prod3 != 0:
+                reasons.append(
+                    f"nrows={nrows} must be divisible by {q1}×{q2}×{q3}={prod3} "
+                    f"(strength-3, factors {f1+1},{f2+1},{f3+1}).")
 
-def minimum_dimension(factor_levels, strength):
-    divs = required_divisors(factor_levels, strength)
-    return lcm_list(sorted(divs))
-
-def check_divisibility(nrows, ncols, factor_levels, strength):
-    """Raise ValueError with a clear message if dimensions are invalid."""
-    divs = required_divisors(factor_levels, strength)
-    errors = []
-    for d in sorted(divs):
-        if nrows % d != 0:
-            errors.append(f"nrows={nrows} is not divisible by {d}")
-        if ncols % d != 0:
-            errors.append(f"ncols={ncols} is not divisible by {d}")
-    if errors:
-        min_d = minimum_dimension(factor_levels, strength)
-        raise ValueError(
-            "Divisibility requirements not met for strength-"
-            f"{strength} design with levels {factor_levels}:\n"
-            + "\n".join(f"  • {e}" for e in errors)
-            + f"\n\nMinimum valid dimension for this configuration: {min_d}×{min_d}."
-            + "\nSet NUM_ROWS = NUM_COLS = "
-            + str(min_d)
-            + " (or any multiple of "
-            + str(min_d)
-            + ")."
-        )
+    return (len(reasons) == 0), reasons
 
 
-# ── Design construction ──────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
+#  Step 1 — generate all valid row configurations
+# ────────────────────────────────────────────────────────────────
 
-def _first_coprime(q):
-    """Smallest integer in [1, q] that is coprime to q."""
-    for c in range(1, q + 1):
-        if gcd(c, q) == 1:
-            return c
-    return 1
-
-def build_design(nrows, ncols, factor_levels):
+def generate_valid_rows(ncols, fl, strength):
     """
-    Generalised cyclic construction:
-      cell(i, j)[f] = (i + c_f * j)  mod  q_f
-    where c_f is coprime to q_f.
-    This guarantees:
-      - every level of factor f appears ncols/q_f times in each row  (vary j, fix i)
-      - every level of factor f appears nrows/q_f times in each col  (vary i, fix j)
-      - strength-2 / strength-3 properties follow from the divisibility conditions.
+    Build every length-ncols sequence of treatment tuples that satisfies:
+      - Row marginal balance for every factor
+      - Row strength-t balance for every t-subset of factors (t ≤ strength)
+    Uses backtracking so it is fast even for moderate ncols.
+    Returns a list of tuples-of-tuples.
     """
-    k  = len(factor_levels)
-    col_coeffs = [_first_coprime(q) for q in factor_levels]
+    k = len(fl)
+    all_treatments = list(itertools.product(*[range(q) for q in fl]))
 
-    array = []
-    for i in range(nrows):
-        row = []
+    rq = [ncols // q for q in fl]
+
+    pair_keys = list(itertools.combinations(range(k), 2)) if strength >= 2 else []
+    trip_keys = list(itertools.combinations(range(k), 3)) if strength >= 3 else []
+    pq = {(f1, f2): ncols // (fl[f1] * fl[f2]) for f1, f2 in pair_keys}
+    tq = {(f1, f2, f3): ncols // (fl[f1] * fl[f2] * fl[f3]) for f1, f2, f3 in trip_keys}
+
+    valid = []
+    cur   = []
+    lev   = [Counter() for _ in range(k)]
+    pc    = {key: Counter() for key in pair_keys}
+    tc    = {key: Counter() for key in trip_keys}
+
+    def bt(pos):
+        if pos == ncols:
+            valid.append(tuple(cur))
+            return
+        for t in all_treatments:
+            # --- level upper bounds ---
+            ok = True
+            for f in range(k):
+                if lev[f][t[f]] + 1 > rq[f]:
+                    ok = False; break
+            if not ok:
+                continue
+            # --- pair upper bounds ---
+            for f1, f2 in pair_keys:
+                if pc[(f1, f2)][(t[f1], t[f2])] + 1 > pq[(f1, f2)]:
+                    ok = False; break
+            if not ok:
+                continue
+            # --- triplet upper bounds ---
+            for f1, f2, f3 in trip_keys:
+                if tc[(f1, f2, f3)][(t[f1], t[f2], t[f3])] + 1 > tq[(f1, f2, f3)]:
+                    ok = False; break
+            if not ok:
+                continue
+            # --- place ---
+            cur.append(t)
+            for f in range(k):
+                lev[f][t[f]] += 1
+            for f1, f2 in pair_keys:
+                pc[(f1, f2)][(t[f1], t[f2])] += 1
+            for f1, f2, f3 in trip_keys:
+                tc[(f1, f2, f3)][(t[f1], t[f2], t[f3])] += 1
+
+            bt(pos + 1)
+
+            cur.pop()
+            for f in range(k):
+                lev[f][t[f]] -= 1
+            for f1, f2 in pair_keys:
+                pc[(f1, f2)][(t[f1], t[f2])] -= 1
+            for f1, f2, f3 in trip_keys:
+                tc[(f1, f2, f3)][(t[f1], t[f2], t[f3])] -= 1
+
+    bt(0)
+    return valid
+
+
+# ────────────────────────────────────────────────────────────────
+#  Step 2 — backtracking search: place rows one at a time
+# ────────────────────────────────────────────────────────────────
+
+def search(nrows, ncols, fl, strength, valid_rows, time_limit, find_all, log):
+    """
+    Row-by-row backtracking.
+    After each row is placed, column constraints are checked incrementally.
+    Returns (solutions, status) where status in {'found','not_found','timeout'}.
+    """
+    k  = len(fl)
+    pair_keys = list(itertools.combinations(range(k), 2)) if strength >= 2 else []
+    trip_keys = list(itertools.combinations(range(k), 3)) if strength >= 3 else []
+
+    # Column quotas
+    col_lev_quota  = [nrows // q for q in fl]
+    col_pair_quota = {(f1, f2): nrows // (fl[f1] * fl[f2]) for f1, f2 in pair_keys}
+    col_trip_quota = {(f1,f2,f3): nrows//(fl[f1]*fl[f2]*fl[f3]) for f1,f2,f3 in trip_keys}
+
+    # Running column counts
+    # col_lev[j][f][v]     = how many times level v of factor f appears in column j so far
+    # col_pair[(f1,f2)][j][(a,b)] = pair count for column j
+    col_lev  = [[Counter() for _ in range(k)] for _ in range(ncols)]
+    col_pair = {key: [defaultdict(int) for _ in range(ncols)] for key in pair_keys}
+    col_trip = {key: [defaultdict(int) for _ in range(ncols)] for key in trip_keys}
+
+    placed = []        # rows placed so far
+    solutions = []
+    t_start   = time.time()
+    nodes     = [0]
+
+    def elapsed():
+        return time.time() - t_start
+
+    def place(row):
+        for j, t in enumerate(row):
+            for f in range(k):
+                col_lev[j][f][t[f]] += 1
+            for f1, f2 in pair_keys:
+                col_pair[(f1,f2)][j][(t[f1],t[f2])] += 1
+            for f1, f2, f3 in trip_keys:
+                col_trip[(f1,f2,f3)][j][(t[f1],t[f2],t[f3])] += 1
+        placed.append(row)
+
+    def unplace(row):
+        for j, t in enumerate(row):
+            for f in range(k):
+                col_lev[j][f][t[f]] -= 1
+            for f1, f2 in pair_keys:
+                col_pair[(f1,f2)][j][(t[f1],t[f2])] -= 1
+            for f1, f2, f3 in trip_keys:
+                col_trip[(f1,f2,f3)][j][(t[f1],t[f2],t[f3])] -= 1
+        placed.pop()
+
+    def row_compatible(row, row_idx):
+        """Check upper-bound column constraints for adding this row."""
+        rows_after = row_idx + 1            # rows placed including this one
+        remaining  = nrows - rows_after     # rows still to place
+
+        for j, t in enumerate(row):
+            # Level upper bound
+            for f in range(k):
+                new_cnt = col_lev[j][f][t[f]] + 1
+                if new_cnt > col_lev_quota[f]:
+                    return False
+                # Lower-bound forward check: can remaining rows fill the deficit?
+                for v in range(fl[f]):
+                    deficit = col_lev_quota[f] - (col_lev[j][f][v] + (1 if t[f]==v else 0))
+                    if deficit > remaining:
+                        return False
+            # Pair upper bound
+            for f1, f2 in pair_keys:
+                if col_pair[(f1,f2)][j][(t[f1],t[f2])] + 1 > col_pair_quota[(f1,f2)]:
+                    return False
+            # Triplet upper bound
+            for f1, f2, f3 in trip_keys:
+                if col_trip[(f1,f2,f3)][j][(t[f1],t[f2],t[f3])] + 1 > col_trip_quota[(f1,f2,f3)]:
+                    return False
+        return True
+
+    def col_complete():
+        """Verify all column constraints are exactly met (called at nrows rows placed)."""
         for j in range(ncols):
-            cell = tuple(
-                (i + col_coeffs[f] * j) % factor_levels[f]
-                for f in range(k)
-            )
-            row.append(cell)
-        array.append(row)
-    return array
+            for f in range(k):
+                for v in range(fl[f]):
+                    if col_lev[j][f][v] != col_lev_quota[f]:
+                        return False
+            for (f1,f2) in pair_keys:
+                for a in range(fl[f1]):
+                    for b in range(fl[f2]):
+                        if col_pair[(f1,f2)][j][(a,b)] != col_pair_quota[(f1,f2)]:
+                            return False
+            for (f1,f2,f3) in trip_keys:
+                for a in range(fl[f1]):
+                    for b in range(fl[f2]):
+                        for c in range(fl[f3]):
+                            if col_trip[(f1,f2,f3)][j][(a,b,c)] != col_trip_quota[(f1,f2,f3)]:
+                                return False
+        return True
+
+    def bt(row_idx):
+        nodes[0] += 1
+        if elapsed() > time_limit:
+            return 'timeout'
+        if row_idx == nrows:
+            if col_complete():
+                solutions.append([list(r) for r in placed])
+                log(f"  ✓ Solution #{len(solutions)} found at {elapsed():.2f}s")
+                if not find_all:
+                    return 'found'
+            return False
+
+        for row in valid_rows:
+            if row_compatible(row, row_idx):
+                place(row)
+                result = bt(row_idx + 1)
+                unplace(row)
+                if result in ('found', 'timeout'):
+                    return result
+        return False
+
+    result = bt(0)
+    e = elapsed()
+
+    if solutions:
+        return solutions, 'found', e, nodes[0]
+    elif result == 'timeout':
+        return [], 'timeout', e, nodes[0]
+    else:
+        return [], 'not_found', e, nodes[0]
 
 
-# ── Verification ─────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
+#  Verification (independent check on found solution)
+# ────────────────────────────────────────────────────────────────
 
-def verify(array, nrows, ncols, factor_levels, strength):
-    k = len(factor_levels)
-    R = {}
+def verify(array, nrows, ncols, fl, strength):
+    k = len(fl)
+    results = {}
 
-    # 1. Treatment balance
     all_cells = [array[i][j] for i in range(nrows) for j in range(ncols)]
-    counts    = Counter(all_cells)
+    counts    = Counter(tuple(c) if not isinstance(c, tuple) else c for c in all_cells)
     freqs     = list(counts.values())
-    R["treatment_balance"] = (len(set(freqs)) == 1, counts)
+    results['treatment_balance'] = (len(set(freqs)) == 1, freqs[0] if freqs else 0)
 
-    # 2. Row marginal balance
     row_ok = True
     for f in range(k):
         for i in range(nrows):
             c = Counter(array[i][j][f] for j in range(ncols))
-            if len(set(c.values())) != 1:
+            if set(c.keys()) != set(range(fl[f])) or len(set(c.values())) != 1:
                 row_ok = False
-    R["row_factor_balance"] = row_ok
+    results['row_balance'] = row_ok
 
-    # 3. Col marginal balance
     col_ok = True
     for f in range(k):
         for j in range(ncols):
             c = Counter(array[i][j][f] for i in range(nrows))
-            if len(set(c.values())) != 1:
+            if set(c.keys()) != set(range(fl[f])) or len(set(c.values())) != 1:
                 col_ok = False
-    R["col_factor_balance"] = col_ok
+    results['col_balance'] = col_ok
 
-    # 4. Strength-2
     if strength >= 2:
         s2r = s2c = True
         for f1, f2 in itertools.combinations(range(k), 2):
+            q1, q2 = fl[f1], fl[f2]
+            all_p = set(itertools.product(range(q1), range(q2)))
             for i in range(nrows):
                 c = Counter((array[i][j][f1], array[i][j][f2]) for j in range(ncols))
-                if len(set(c.values())) != 1: s2r = False
+                if set(c.keys()) != all_p or len(set(c.values())) != 1:
+                    s2r = False
             for j in range(ncols):
                 c = Counter((array[i][j][f1], array[i][j][f2]) for i in range(nrows))
-                if len(set(c.values())) != 1: s2c = False
-        R["strength2_rows"] = s2r
-        R["strength2_cols"] = s2c
+                if set(c.keys()) != all_p or len(set(c.values())) != 1:
+                    s2c = False
+        results['strength2_rows'] = s2r
+        results['strength2_cols'] = s2c
 
-    # 5. Strength-3
     if strength >= 3:
         s3r = s3c = True
         for f1, f2, f3 in itertools.combinations(range(k), 3):
+            q1, q2, q3 = fl[f1], fl[f2], fl[f3]
+            all_t = set(itertools.product(range(q1), range(q2), range(q3)))
             for i in range(nrows):
-                c = Counter((array[i][j][f1], array[i][j][f2], array[i][j][f3]) for j in range(ncols))
-                if len(set(c.values())) != 1: s3r = False
+                c = Counter((array[i][j][f1], array[i][j][f2], array[i][j][f3])
+                             for j in range(ncols))
+                if set(c.keys()) != all_t or len(set(c.values())) != 1:
+                    s3r = False
             for j in range(ncols):
-                c = Counter((array[i][j][f1], array[i][j][f2], array[i][j][f3]) for i in range(nrows))
-                if len(set(c.values())) != 1: s3c = False
-        R["strength3_rows"] = s3r
-        R["strength3_cols"] = s3c
+                c = Counter((array[i][j][f1], array[i][j][f2], array[i][j][f3])
+                             for i in range(nrows))
+                if set(c.keys()) != all_t or len(set(c.values())) != 1:
+                    s3c = False
+        results['strength3_rows'] = s3r
+        results['strength3_cols'] = s3c
 
-    return R
+    return results
 
 
-# ── Styles ───────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
+#  Excel output
+# ────────────────────────────────────────────────────────────────
 
 HDR_FILL  = PatternFill("solid", fgColor="1F4E79")
 HDR_FONT  = Font(name="Arial", bold=True, color="FFFFFF", size=10)
 SUB_FILL  = PatternFill("solid", fgColor="2E75B6")
 SUB_FONT  = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-CELL_FONT = Font(name="Arial", size=10)
-LBL_FONT  = Font(name="Arial", bold=True, size=10)
+ALT_FILL  = PatternFill("solid", fgColor="DDEEFF")
 PASS_FILL = PatternFill("solid", fgColor="C6EFCE")
 FAIL_FILL = PatternFill("solid", fgColor="FFC7CE")
 PASS_FONT = Font(name="Arial", bold=True, color="006100", size=10)
 FAIL_FONT = Font(name="Arial", bold=True, color="9C0006", size=10)
-ALT_FILL  = PatternFill("solid", fgColor="DDEEFF")
-
+WARN_FILL = PatternFill("solid", fgColor="FFEB9C")
+WARN_FONT = Font(name="Arial", bold=True, color="9C5700", size=10)
+CELL_FONT = Font(name="Arial", size=10)
+LBL_FONT  = Font(name="Arial", bold=True, size=10)
+THIN = Side(style="thin", color="AAAAAA")
+MED  = Side(style="medium", color="444444")
 FACTOR_FILLS = [
     PatternFill("solid", fgColor="D9E1F2"),
     PatternFill("solid", fgColor="FFF2CC"),
     PatternFill("solid", fgColor="E2EFDA"),
     PatternFill("solid", fgColor="FCE4D6"),
     PatternFill("solid", fgColor="EAD1DC"),
-    PatternFill("solid", fgColor="D9EAD3"),
+    PatternFill("solid", fgColor="CFE2F3"),
 ]
 
-THIN = Side(style="thin",   color="AAAAAA")
-MED  = Side(style="medium", color="444444")
+def tborder(): return Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
-def tborder():
-    return Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
-
-def set_hdr(cell, text, width=None):
-    cell.value     = text
-    cell.fill      = HDR_FILL
-    cell.font      = HDR_FONT
+def shdr(cell, text):
+    cell.value = text; cell.fill = HDR_FILL; cell.font = HDR_FONT
     cell.alignment = Alignment(horizontal="center", vertical="center")
-    cell.border    = tborder()
+    cell.border = tborder()
 
-def set_sub(cell, text):
-    cell.value     = text
-    cell.fill      = SUB_FILL
-    cell.font      = SUB_FONT
+def ssub(cell, text):
+    cell.value = text; cell.fill = SUB_FILL; cell.font = SUB_FONT
     cell.alignment = Alignment(horizontal="center", vertical="center")
-    cell.border    = tborder()
+    cell.border = tborder()
 
 
-# ── Sheet writers ────────────────────────────────────────────────
+def write_not_found_workbook(wb, nrows, ncols, fl, strength, status,
+                              elapsed, nodes, reasons, valid_row_count):
+    ws = wb.active
+    ws.title = "Search Result"
+    ws.column_dimensions["A"].width = 80
 
-def sheet_design(wb, array, nrows, ncols, factor_levels, strength):
+    title_text = {
+        'not_found': "EXHAUSTIVE SEARCH COMPLETE — Design Does NOT Exist",
+        'timeout':   "SEARCH TIMED OUT — Result Inconclusive",
+        'infeasible':"DESIGN IS INFEASIBLE — Divisibility Requirements Not Met",
+    }[status]
+
+    title_fill = {
+        'not_found': PatternFill("solid", fgColor="FFC7CE"),
+        'timeout':   PatternFill("solid", fgColor="FFEB9C"),
+        'infeasible':PatternFill("solid", fgColor="FFC7CE"),
+    }[status]
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=3)
+    tc = ws.cell(1, 1, title_text)
+    tc.fill = title_fill
+    tc.font = Font(name="Arial", bold=True, size=14,
+                   color="9C0006" if status != 'timeout' else "9C5700")
+    tc.alignment = Alignment(horizontal="center")
+    ws.row_dimensions[1].height = 30
+
+    r = 3
+    def info(label, value, row):
+        ws.cell(row, 1, label).font = LBL_FONT
+        ws.cell(row, 2, str(value)).font = CELL_FONT
+        ws.column_dimensions["B"].width = 40
+
+    info("Parameters:", f"nrows={nrows}, ncols={ncols}, levels={fl}, strength={strength}", r); r+=1
+    info("Search time:", f"{elapsed:.2f} seconds", r); r+=1
+    info("Nodes explored:", f"{nodes:,}", r); r+=1
+    info("Valid row configurations found:", valid_row_count, r); r+=1
+    r += 1
+
+    if status == 'infeasible':
+        ws.cell(r, 1, "Why infeasible:").font = LBL_FONT; r+=1
+        for reason in reasons:
+            c = ws.cell(r, 1, f"  • {reason}")
+            c.font = Font(name="Arial", size=10, color="9C0006"); r+=1
+    elif status == 'not_found':
+        ws.cell(r, 1, "Conclusion:").font = LBL_FONT; r+=1
+        msg = (f"A {nrows}×{ncols} row-column factorial design with factor levels {fl} "
+               f"and strength {strength} does NOT exist. The backtracking search exhaustively "
+               f"explored all {nodes:,} possible row combinations and found no valid arrangement.")
+        c = ws.cell(r, 1, msg)
+        c.font = Font(name="Arial", size=10); c.alignment = Alignment(wrap_text=True)
+        ws.row_dimensions[r].height = 50; r+=2
+        ws.cell(r, 1, "What to try instead:").font = LBL_FONT; r+=1
+        suggestions = [
+            f"Increase nrows and/or ncols (next valid multiples satisfying divisibility).",
+            f"Reduce the number of factors (fewer factors = less constraint).",
+            f"Reduce strength from {strength} to {strength-1}." if strength > 1 else
+            f"Check if the parameter combination has a known theoretical construction.",
+        ]
+        for s in suggestions:
+            ws.cell(r, 1, f"  • {s}").font = Font(name="Arial", size=10, italic=True); r+=1
+    elif status == 'timeout':
+        ws.cell(r, 1, "What happened:").font = LBL_FONT; r+=1
+        msg = (f"The search did not finish within the time limit. "
+               f"This does NOT mean the design doesn't exist — the search space "
+               f"may simply be too large. Try: increasing TIME_LIMIT, reducing parameters, "
+               f"or using a different search strategy.")
+        c = ws.cell(r, 1, msg)
+        c.font = Font(name="Arial", size=10); c.alignment = Alignment(wrap_text=True)
+        ws.row_dimensions[r].height = 50
+
+
+def write_found_workbook(wb, array, nrows, ncols, fl, strength,
+                          elapsed, nodes, ver_results, valid_row_count):
+    k = len(fl)
+
+    # ── Sheet 1: Design Array ────────────────────────────────────
     ws = wb.active
     ws.title = "Design Array"
-    k = len(factor_levels)
 
-    # Title
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols + 1)
-    c = ws.cell(1, 1,
-        f"Row-Column Factorial Design  |  "
-        f"{nrows}×{ncols}  |  {k} Factors {factor_levels}  |  Strength {strength}")
-    c.font      = Font(name="Arial", bold=True, size=13, color="1F3864")
-    c.alignment = Alignment(horizontal="center")
+    t = ws.cell(1, 1,
+        f"Row-Column Factorial Design  |  {nrows}×{ncols}  |  "
+        f"Factors: {k}  |  Levels: {fl}  |  Strength: {strength}")
+    t.font = Font(name="Arial", bold=True, size=13, color="1F3864")
+    t.alignment = Alignment(horizontal="center")
     ws.row_dimensions[1].height = 26
 
-    ws.cell(2, 1, "Cell entries show (F1, F2, …, Fk) level tuple (0-indexed)."
-        ).font = Font(name="Arial", italic=True, size=9, color="555555")
-    ws.row_dimensions[3].height = 6   # spacer
+    ws.cell(2, 1,
+        f"Found by exhaustive backtracking search in {elapsed:.2f}s "
+        f"({nodes:,} nodes, {valid_row_count} valid row templates)."
+    ).font = Font(name="Arial", italic=True, size=9, color="444444")
+    ws.row_dimensions[3].height = 5
 
-    # Column headers
-    set_hdr(ws.cell(4, 1), "Row \\ Col")
+    shdr(ws.cell(4, 1), "Row \\ Col")
     ws.column_dimensions["A"].width = 10
+    cw = max(12, 3 * k + 4)
     for j in range(ncols):
-        set_hdr(ws.cell(4, j + 2), f"C{j+1}")
-        ws.column_dimensions[get_column_letter(j + 2)].width = max(12, 3 * k + 3)
+        shdr(ws.cell(4, j + 2), f"C{j+1}")
+        ws.column_dimensions[get_column_letter(j + 2)].width = cw
 
-    # Data
     for i in range(nrows):
-        set_sub(ws.cell(i + 5, 1), f"R{i+1}")
+        ssub(ws.cell(i + 5, 1), f"R{i+1}")
         for j in range(ncols):
             tup  = array[i][j]
             text = "(" + ",".join(str(v) for v in tup) + ")"
@@ -261,425 +509,328 @@ def sheet_design(wb, array, nrows, ncols, factor_levels, strength):
             c.font      = Font(name="Arial", size=10)
             c.alignment = Alignment(horizontal="center")
             c.border    = tborder()
-            if i % 2 == 0:
-                c.fill = ALT_FILL
+            c.fill      = ALT_FILL if i % 2 == 0 else PatternFill()
         ws.row_dimensions[i + 5].height = 18
 
-    # Design info block (below)
-    info_row = nrows + 7
-    ws.cell(info_row,     1, "Design Parameters").font = LBL_FONT
-    ws.cell(info_row + 1, 1, f"Rows (R):").font = CELL_FONT
-    ws.cell(info_row + 1, 2, nrows).font = CELL_FONT
-    ws.cell(info_row + 2, 1, "Columns (C):").font = CELL_FONT
-    ws.cell(info_row + 2, 2, ncols).font = CELL_FONT
-    ws.cell(info_row + 3, 1, "Number of factors (k):").font = CELL_FONT
-    ws.cell(info_row + 3, 2, k).font = CELL_FONT
-    ws.cell(info_row + 4, 1, "Factor level counts:").font = CELL_FONT
-    ws.cell(info_row + 4, 2, str(factor_levels)).font = CELL_FONT
-    ws.cell(info_row + 5, 1, "Strength:").font = CELL_FONT
-    ws.cell(info_row + 5, 2, strength).font = CELL_FONT
-    ws.cell(info_row + 6, 1, "Total treatments:").font = CELL_FONT
+    # Design info block
     prod = 1
-    for q in factor_levels: prod *= q
-    ws.cell(info_row + 6, 2, prod).font = CELL_FONT
-    ws.cell(info_row + 7, 1, "Total cells:").font = CELL_FONT
-    ws.cell(info_row + 7, 2, nrows * ncols).font = CELL_FONT
+    for q in fl: prod *= q
     rep = (nrows * ncols) // prod
-    ws.cell(info_row + 8, 1, "Each treatment repeats:").font = CELL_FONT
-    ws.cell(info_row + 8, 2, f"{rep} time(s)").font = CELL_FONT
+    ir = nrows + 7
+    for off, (lbl, val) in enumerate([
+        ("Rows:", nrows), ("Columns:", ncols), ("Factors:", k),
+        ("Factor levels:", str(fl)), ("Strength:", strength),
+        ("Total treatments:", prod), ("Array cells:", nrows * ncols),
+        ("Each treatment repeats:", f"{rep}×"),
+        ("Search time:", f"{elapsed:.3f}s"),
+        ("Nodes explored:", f"{nodes:,}"),
+    ]):
+        ws.cell(ir + off, 1, lbl).font = LBL_FONT
+        ws.cell(ir + off, 2, str(val)).font = CELL_FONT
+    ws.column_dimensions["B"].width = 25
 
-
-def sheet_factor(wb, array, nrows, ncols, factor_levels):
-    for f in range(len(factor_levels)):
-        q    = factor_levels[f]
+    # ── Sheet 2+: one sheet per factor ─────────────────────────
+    for f in range(k):
+        q    = fl[f]
         fill = FACTOR_FILLS[f % len(FACTOR_FILLS)]
-        ws   = wb.create_sheet(f"Factor {f+1}")
-
-        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols + 1)
-        c = ws.cell(1, 1, f"Factor {f+1}  ({q} levels: 0 – {q-1})")
-        c.font = Font(name="Arial", bold=True, size=12, color="1F3864")
-        c.alignment = Alignment(horizontal="center")
-
-        set_hdr(ws.cell(2, 1), "Row \\ Col")
-        ws.column_dimensions["A"].width = 10
+        ws2  = wb.create_sheet(f"Factor {f+1} (q={q})")
+        ws2.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols + 1)
+        ws2.cell(1, 1, f"Factor {f+1}  —  {q} levels  (0 to {q-1})"
+            ).font = Font(name="Arial", bold=True, size=12, color="1F3864")
+        ws2.cell(1, 1).alignment = Alignment(horizontal="center")
+        shdr(ws2.cell(2, 1), "Row \\ Col")
+        ws2.column_dimensions["A"].width = 10
         for j in range(ncols):
-            set_hdr(ws.cell(2, j + 2), f"C{j+1}")
-            ws.column_dimensions[get_column_letter(j + 2)].width = 10
-
+            shdr(ws2.cell(2, j + 2), f"C{j+1}")
+            ws2.column_dimensions[get_column_letter(j + 2)].width = 9
         for i in range(nrows):
-            set_sub(ws.cell(i + 3, 1), f"R{i+1}")
+            ssub(ws2.cell(i + 3, 1), f"R{i+1}")
             for j in range(ncols):
-                c = ws.cell(i + 3, j + 2, array[i][j][f])
-                c.fill      = fill
-                c.font      = Font(name="Arial", size=10, bold=True)
-                c.alignment = Alignment(horizontal="center")
-                c.border    = tborder()
-            ws.row_dimensions[i + 3].height = 18
+                c = ws2.cell(i + 3, j + 2, array[i][j][f])
+                c.fill = fill; c.font = Font(name="Arial", size=10, bold=True)
+                c.alignment = Alignment(horizontal="center"); c.border = tborder()
+            ws2.row_dimensions[i + 3].height = 18
 
+    # ── Verification sheet ──────────────────────────────────────
+    ws3 = wb.create_sheet("Verification")
+    ws3.merge_cells(start_row=1, start_column=1, end_row=1, end_column=4)
+    ws3.cell(1, 1, "Independent Verification of All Design Properties"
+        ).font = Font(name="Arial", bold=True, size=13, color="1F3864")
+    ws3.cell(1, 1).alignment = Alignment(horizontal="center")
+    ws3.row_dimensions[1].height = 24
+    ws3.column_dimensions["A"].width = 55
+    ws3.column_dimensions["B"].width = 14
+    ws3.column_dimensions["C"].width = 70
 
-def sheet_verification(wb, results, nrows, ncols, factor_levels, strength):
-    ws = wb.create_sheet("Verification")
-    k  = len(factor_levels)
+    for ci, txt in enumerate(["Property", "Result", "Interpretation"], 1):
+        shdr(ws3.cell(3, ci), txt)
 
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=5)
-    t = ws.cell(1, 1, "Design Verification Report")
-    t.font = Font(name="Arial", bold=True, size=14, color="1F3864")
-    t.alignment = Alignment(horizontal="center")
-    ws.row_dimensions[1].height = 26
-
-    ws.column_dimensions["A"].width = 50
-    ws.column_dimensions["B"].width = 14
-    ws.column_dimensions["C"].width = 70
-    ws.column_dimensions["D"].width = 12
-
-    def hdr(r, texts):
-        for ci, txt in enumerate(texts, 1):
-            set_hdr(ws.cell(r, ci), txt)
-
-    def prow(r, label, ok, detail=""):
-        ws.cell(r, 1, label).font = CELL_FONT
-        c = ws.cell(r, 2, "PASS ✓" if ok else "FAIL ✗")
+    r = 4
+    def prow(label, ok, detail=""):
+        ws3.cell(r, 1, label).font = CELL_FONT
+        c = ws3.cell(r, 2, "PASS ✓" if ok else "FAIL ✗")
         c.fill, c.font = (PASS_FILL, PASS_FONT) if ok else (FAIL_FILL, FAIL_FONT)
         c.alignment = Alignment(horizontal="center")
-        ws.cell(r, 3, detail).font = Font(name="Arial", size=9, color="333333")
-        ws.row_dimensions[r].height = 18
+        ws3.cell(r, 3, detail).font = Font(name="Arial", size=9, color="333333")
+        ws3.row_dimensions[r].height = 18
 
-    hdr(3, ["Property", "Status", "Detail / Interpretation"])
-    r = 4
-
-    ok, counts = results["treatment_balance"]
-    freqs = list(counts.values())
-    prow(r, "Each treatment appears equally often in the array",
-         ok, f"Repetition frequency = {freqs[0]}" if ok else f"Unequal counts: max={max(freqs)}, min={min(freqs)}")
-    r += 1
-
-    prow(r, "Each factor level appears equally often in every ROW",
-         results["row_factor_balance"],
-         "Each level of factor f appears ncols/q_f times per row")
-    r += 1
-
-    prow(r, "Each factor level appears equally often in every COLUMN",
-         results["col_factor_balance"],
-         "Each level of factor f appears nrows/q_f times per column")
-    r += 1
-
+    ok, rep = ver_results['treatment_balance']
+    prow("Treatment balance — each treatment appears equally often", ok,
+         f"Every treatment tuple appears exactly {rep} time(s)"); r+=1
+    prow("Row marginal balance — each level appears equally in every row",
+         ver_results['row_balance'],
+         f"Each level of factor f appears ncols/q_f times in every row"); r+=1
+    prow("Column marginal balance — each level appears equally in every column",
+         ver_results['col_balance'],
+         f"Each level of factor f appears nrows/q_f times in every column"); r+=1
     if strength >= 2:
-        prow(r, "Strength-2: every ordered pair of levels balanced in each ROW",
-             results.get("strength2_rows", False),
-             "For any 2 factor positions, each ordered pair appears equally often in each row")
-        r += 1
-        prow(r, "Strength-2: every ordered pair of levels balanced in each COLUMN",
-             results.get("strength2_cols", False),
-             "For any 2 factor positions, each ordered pair appears equally often in each column")
-        r += 1
+        prow("Strength-2 (rows) — every ordered pair balanced in each row",
+             ver_results.get('strength2_rows', False),
+             "Fix any 2 factor positions: each ordered pair of levels appears equally in each row"); r+=1
+        prow("Strength-2 (cols) — every ordered pair balanced in each column",
+             ver_results.get('strength2_cols', False),
+             "Fix any 2 factor positions: each ordered pair of levels appears equally in each column"); r+=1
+    if strength >= 3:
+        prow("Strength-3 (rows) — every ordered triplet balanced in each row",
+             ver_results.get('strength3_rows', False),
+             "Fix any 3 factor positions: each ordered triplet appears equally in each row"); r+=1
+        prow("Strength-3 (cols) — every ordered triplet balanced in each column",
+             ver_results.get('strength3_cols', False),
+             "Fix any 3 factor positions: each ordered triplet appears equally in each column"); r+=1
+
+    all_ok = all(v[0] if isinstance(v, tuple) else v for v in ver_results.values())
+    r += 1
+    ws3.merge_cells(start_row=r, start_column=1, end_row=r, end_column=3)
+    c = ws3.cell(r, 1, "✓  ALL PROPERTIES VERIFIED" if all_ok else "✗  VERIFICATION FAILED")
+    c.fill = PASS_FILL if all_ok else FAIL_FILL
+    c.font = Font(name="Arial", bold=True, size=12,
+                  color="006100" if all_ok else "9C0006")
+    c.alignment = Alignment(horizontal="center")
+    ws3.row_dimensions[r].height = 24
+
+    # ── Row frequency sheet ─────────────────────────────────────
+    write_freq_sheet(wb, array, nrows, ncols, fl, "row")
+    write_freq_sheet(wb, array, nrows, ncols, fl, "col")
+
+    # ── Pair frequency sheets ───────────────────────────────────
+    if strength >= 2:
+        write_pair_sheet(wb, array, nrows, ncols, fl, "row")
+        write_pair_sheet(wb, array, nrows, ncols, fl, "col")
 
     if strength >= 3:
-        prow(r, "Strength-3: every ordered triplet balanced in each ROW",
-             results.get("strength3_rows", False),
-             "For any 3 factor positions, each ordered triplet appears equally often in each row")
-        r += 1
-        prow(r, "Strength-3: every ordered triplet balanced in each COLUMN",
-             results.get("strength3_cols", False),
-             "For any 3 factor positions, each ordered triplet appears equally often in each column")
-        r += 1
-
-    all_ok = all([
-        results["treatment_balance"][0],
-        results["row_factor_balance"],
-        results["col_factor_balance"],
-        results.get("strength2_rows", True),
-        results.get("strength2_cols", True),
-        results.get("strength3_rows", True),
-        results.get("strength3_cols", True),
-    ])
-    r += 1
-    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=3)
-    msg = "✓  All required design properties are satisfied!" if all_ok \
-          else "✗  One or more design properties NOT satisfied — see rows above."
-    c = ws.cell(r, 1, msg)
-    c.fill      = PASS_FILL if all_ok else FAIL_FILL
-    c.font      = Font(name="Arial", bold=True, size=12,
-                       color="006100" if all_ok else "9C0006")
-    c.alignment = Alignment(horizontal="center")
-    ws.row_dimensions[r].height = 24
+        write_triplet_sheet(wb, array, nrows, ncols, fl, "row")
+        write_triplet_sheet(wb, array, nrows, ncols, fl, "col")
 
 
-def sheet_freq(wb, array, nrows, ncols, factor_levels, by="row"):
+def write_freq_sheet(wb, array, nrows, ncols, fl, by):
     label = "Row" if by == "row" else "Col"
-    ws    = wb.create_sheet(f"{label} Freq Tables")
+    ws = wb.create_sheet(f"{label} Freq")
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=12)
+    ws.cell(1, 1, f"Level Frequency per {label}  —  Marginal Balance Check"
+        ).font = Font(name="Arial", bold=True, size=12, color="1F3864")
+    ws.cell(1, 1).alignment = Alignment(horizontal="center")
+    k = len(fl); cur = 3; outer = nrows if by == "row" else ncols
 
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=10)
-    t = ws.cell(1, 1, f"Level Frequency per {label} — marginal balance check")
-    t.font = Font(name="Arial", bold=True, size=13, color="1F3864")
-    t.alignment = Alignment(horizontal="center")
-
-    cur = 3
-    k   = len(factor_levels)
     for f in range(k):
-        q    = factor_levels[f]
-        fill = FACTOR_FILLS[f % len(FACTOR_FILLS)]
-
-        ws.cell(cur, 1, f"Factor {f+1}  ({q} levels)").font = LBL_FONT
+        q = fl[f]; fill = FACTOR_FILLS[f % len(FACTOR_FILLS)]
+        ws.cell(cur, 1, f"Factor {f+1}  ({q} levels)").font = LBL_FONT; cur += 1
+        shdr(ws.cell(cur, 1), label); ws.column_dimensions["A"].width = 10
+        for v in range(q):
+            shdr(ws.cell(cur, v + 2), f"Level {v}")
+            ws.column_dimensions[get_column_letter(v + 2)].width = 10
+        shdr(ws.cell(cur, q + 2), "Uniform?")
+        ws.column_dimensions[get_column_letter(q + 2)].width = 11
         cur += 1
-
-        set_hdr(ws.cell(cur, 1), label)
-        ws.column_dimensions["A"].width = 10
-        for lvl in range(q):
-            set_hdr(ws.cell(cur, lvl + 2), f"Level {lvl}")
-            ws.column_dimensions[get_column_letter(lvl + 2)].width = 11
-        set_hdr(ws.cell(cur, q + 2), "Uniform?")
-        ws.column_dimensions[get_column_letter(q + 2)].width = 12
-        cur += 1
-
-        outer = range(nrows) if by == "row" else range(ncols)
-        for idx in outer:
+        quota = (ncols if by == "row" else nrows) // q
+        for idx in range(outer):
             if by == "row":
                 cnt = Counter(array[idx][j][f] for j in range(ncols))
             else:
                 cnt = Counter(array[i][idx][f] for i in range(nrows))
-
-            set_sub(ws.cell(cur, 1), f"{'R' if by=='row' else 'C'}{idx+1}")
-            vals = [cnt.get(lvl, 0) for lvl in range(q)]
-            uniform = len(set(vals)) == 1
-            for lvl in range(q):
-                c = ws.cell(cur, lvl + 2, vals[lvl])
-                c.fill      = fill
-                c.font      = Font(name="Arial", size=10)
-                c.alignment = Alignment(horizontal="center")
-                c.border    = tborder()
-            c2 = ws.cell(cur, q + 2, "YES ✓" if uniform else "NO ✗")
-            c2.fill, c2.font = (PASS_FILL, PASS_FONT) if uniform else (FAIL_FILL, FAIL_FONT)
-            c2.alignment = Alignment(horizontal="center")
-            cur += 1
+            ssub(ws.cell(cur, 1), f"{'R' if by=='row' else 'C'}{idx+1}")
+            vals = [cnt.get(v, 0) for v in range(q)]
+            unif = len(set(vals)) == 1 and all(v == quota for v in vals)
+            for v in range(q):
+                c = ws.cell(cur, v + 2, vals[v]); c.fill = fill
+                c.font = Font(name="Arial", size=10)
+                c.alignment = Alignment(horizontal="center"); c.border = tborder()
+            c2 = ws.cell(cur, q + 2, "YES ✓" if unif else "NO ✗")
+            c2.fill, c2.font = (PASS_FILL, PASS_FONT) if unif else (FAIL_FILL, FAIL_FONT)
+            c2.alignment = Alignment(horizontal="center"); cur += 1
         cur += 1
 
 
-def sheet_pair_freq(wb, array, nrows, ncols, factor_levels, by="row", strength=2):
+def write_pair_sheet(wb, array, nrows, ncols, fl, by):
     label = "Row" if by == "row" else "Col"
-    ws    = wb.create_sheet(f"Pair Freq ({label})")
-    k     = len(factor_levels)
+    ws = wb.create_sheet(f"Pair Freq ({label})")
+    k = len(fl); outer = nrows if by == "row" else ncols
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=16)
+    ws.cell(1, 1, f"Ordered-Pair Frequencies per {label}  —  Strength-2 Check"
+        ).font = Font(name="Arial", bold=True, size=12, color="1F3864")
+    ws.cell(1, 1).alignment = Alignment(horizontal="center")
+    cur = 3; quota = (ncols if by=="row" else nrows)
 
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=14)
-    t = ws.cell(1, 1, f"Ordered-Pair Frequencies per {label}  (Strength-2 check)")
-    t.font = Font(name="Arial", bold=True, size=13, color="1F3864")
-    t.alignment = Alignment(horizontal="center")
-
-    cur = 3
     for f1, f2 in itertools.combinations(range(k), 2):
-        q1, q2 = factor_levels[f1], factor_levels[f2]
-        pairs  = list(itertools.product(range(q1), range(q2)))
-
-        ws.cell(cur, 1, f"Factors {f1+1}×{f2+1}  ({q1}×{q2} pairs)"
-                ).font = LBL_FONT
-        cur += 1
-
-        set_hdr(ws.cell(cur, 1), label)
-        ws.column_dimensions["A"].width = 8
-        for pidx, (a, b) in enumerate(pairs):
-            set_hdr(ws.cell(cur, pidx + 2), f"({a},{b})")
-            ws.column_dimensions[get_column_letter(pidx + 2)].width = 8
-        set_hdr(ws.cell(cur, len(pairs) + 2), "Uniform?")
+        q1, q2 = fl[f1], fl[f2]
+        pairs = list(itertools.product(range(q1), range(q2)))
+        pq = quota // (q1 * q2)
+        ws.cell(cur, 1, f"Factors {f1+1} × {f2+1}   ({q1}×{q2} = {q1*q2} ordered pairs,"
+                        f" quota per {label.lower()} = {pq})"
+            ).font = LBL_FONT; cur += 1
+        shdr(ws.cell(cur, 1), label); ws.column_dimensions["A"].width = 9
+        for pi, (a, b) in enumerate(pairs):
+            shdr(ws.cell(cur, pi + 2), f"({a},{b})")
+            ws.column_dimensions[get_column_letter(pi + 2)].width = 8
+        shdr(ws.cell(cur, len(pairs) + 2), "Uniform?")
         ws.column_dimensions[get_column_letter(len(pairs) + 2)].width = 11
         cur += 1
 
-        outer = range(nrows) if by == "row" else range(ncols)
-        for idx in outer:
+        for idx in range(outer):
             if by == "row":
-                cnt = Counter((array[idx][j][f1], array[idx][j][f2])
-                              for j in range(ncols))
+                cnt = Counter((array[idx][j][f1], array[idx][j][f2]) for j in range(ncols))
             else:
-                cnt = Counter((array[i][idx][f1], array[i][idx][f2])
-                              for i in range(nrows))
-
-            set_sub(ws.cell(cur, 1),
-                    f"{'R' if by=='row' else 'C'}{idx+1}")
-            vals    = [cnt.get(p, 0) for p in pairs]
-            uniform = len(set(vals)) == 1
-            fill    = PASS_FILL if uniform else FAIL_FILL
-
-            for pidx, p in enumerate(pairs):
-                c = ws.cell(cur, pidx + 2, cnt.get(p, 0))
-                c.fill      = fill
-                c.font      = Font(name="Arial", size=9)
-                c.alignment = Alignment(horizontal="center")
-                c.border    = tborder()
-            c2 = ws.cell(cur, len(pairs) + 2,
-                         "YES ✓" if uniform else "NO ✗")
-            c2.fill, c2.font = (PASS_FILL, PASS_FONT) if uniform else (FAIL_FILL, FAIL_FONT)
-            c2.alignment = Alignment(horizontal="center")
-            cur += 1
+                cnt = Counter((array[i][idx][f1], array[i][idx][f2]) for i in range(nrows))
+            ssub(ws.cell(cur, 1), f"{'R' if by=='row' else 'C'}{idx+1}")
+            vals = [cnt.get(p, 0) for p in pairs]
+            ok   = (set(cnt.keys()) == set(pairs)) and all(v == pq for v in vals)
+            fill = PASS_FILL if ok else FAIL_FILL
+            for pi, p in enumerate(pairs):
+                c = ws.cell(cur, pi + 2, cnt.get(p, 0))
+                c.fill = fill; c.font = Font(name="Arial", size=9)
+                c.alignment = Alignment(horizontal="center"); c.border = tborder()
+            c2 = ws.cell(cur, len(pairs) + 2, "YES ✓" if ok else "NO ✗")
+            c2.fill, c2.font = (PASS_FILL, PASS_FONT) if ok else (FAIL_FILL, FAIL_FONT)
+            c2.alignment = Alignment(horizontal="center"); cur += 1
         cur += 1
 
 
-def sheet_triplet_freq(wb, array, nrows, ncols, factor_levels, by="row"):
+def write_triplet_sheet(wb, array, nrows, ncols, fl, by):
     label = "Row" if by == "row" else "Col"
-    ws    = wb.create_sheet(f"Triplet Freq ({label})")
-    k     = len(factor_levels)
+    ws = wb.create_sheet(f"Triplet Freq ({label})")
+    k = len(fl); outer = nrows if by == "row" else ncols
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=20)
+    ws.cell(1, 1, f"Ordered-Triplet Frequencies per {label}  —  Strength-3 Check"
+        ).font = Font(name="Arial", bold=True, size=12, color="1F3864")
+    ws.cell(1, 1).alignment = Alignment(horizontal="center")
+    cur = 3; quota = ncols if by == "row" else nrows
 
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=8)
-    t = ws.cell(1, 1, f"Ordered-Triplet Frequencies per {label}  (Strength-3 check)")
-    t.font = Font(name="Arial", bold=True, size=13, color="1F3864")
-    t.alignment = Alignment(horizontal="center")
-
-    cur = 3
     for f1, f2, f3 in itertools.combinations(range(k), 3):
-        q1, q2, q3 = factor_levels[f1], factor_levels[f2], factor_levels[f3]
-        triplets   = list(itertools.product(range(q1), range(q2), range(q3)))
-
-        ws.cell(cur, 1, f"Factors {f1+1}×{f2+1}×{f3+1}  ({q1}×{q2}×{q3} triplets)"
-                ).font = LBL_FONT
+        q1, q2, q3 = fl[f1], fl[f2], fl[f3]
+        trips = list(itertools.product(range(q1), range(q2), range(q3)))
+        tq = quota // (q1 * q2 * q3)
+        ws.cell(cur, 1, f"Factors {f1+1}×{f2+1}×{f3+1}  ({q1*q2*q3} ordered triplets, quota={tq})"
+            ).font = LBL_FONT; cur += 1
+        shdr(ws.cell(cur, 1), label); ws.column_dimensions["A"].width = 9
+        for ti, tpl in enumerate(trips):
+            shdr(ws.cell(cur, ti + 2), str(tpl))
+            ws.column_dimensions[get_column_letter(ti + 2)].width = 9
+        shdr(ws.cell(cur, len(trips) + 2), "Uniform?")
+        ws.column_dimensions[get_column_letter(len(trips) + 2)].width = 11
         cur += 1
 
-        set_hdr(ws.cell(cur, 1), label)
-        ws.column_dimensions["A"].width = 8
-        for tidx, tpl in enumerate(triplets):
-            set_hdr(ws.cell(cur, tidx + 2), str(tpl))
-            ws.column_dimensions[get_column_letter(tidx + 2)].width = 10
-        set_hdr(ws.cell(cur, len(triplets) + 2), "Uniform?")
-        ws.column_dimensions[get_column_letter(len(triplets) + 2)].width = 11
-        cur += 1
-
-        outer = range(nrows) if by == "row" else range(ncols)
-        for idx in outer:
+        for idx in range(outer):
             if by == "row":
                 cnt = Counter((array[idx][j][f1], array[idx][j][f2], array[idx][j][f3])
-                              for j in range(ncols))
+                               for j in range(ncols))
             else:
                 cnt = Counter((array[i][idx][f1], array[i][idx][f2], array[i][idx][f3])
-                              for i in range(nrows))
-
-            set_sub(ws.cell(cur, 1), f"{'R' if by=='row' else 'C'}{idx+1}")
-            vals    = [cnt.get(t, 0) for t in triplets]
-            uniform = len(set(vals)) == 1
-            fill    = PASS_FILL if uniform else FAIL_FILL
-
-            for tidx, t in enumerate(triplets):
-                c = ws.cell(cur, tidx + 2, cnt.get(t, 0))
-                c.fill      = fill
-                c.font      = Font(name="Arial", size=9)
-                c.alignment = Alignment(horizontal="center")
-                c.border    = tborder()
-            c2 = ws.cell(cur, len(triplets) + 2,
-                         "YES ✓" if uniform else "NO ✗")
-            c2.fill, c2.font = (PASS_FILL, PASS_FONT) if uniform else (FAIL_FILL, FAIL_FONT)
-            c2.alignment = Alignment(horizontal="center")
-            cur += 1
+                               for i in range(nrows))
+            ssub(ws.cell(cur, 1), f"{'R' if by=='row' else 'C'}{idx+1}")
+            vals = [cnt.get(tp, 0) for tp in trips]
+            ok   = (set(cnt.keys()) == set(trips)) and all(v == tq for v in vals)
+            fill = PASS_FILL if ok else FAIL_FILL
+            for ti, tp in enumerate(trips):
+                c = ws.cell(cur, ti + 2, cnt.get(tp, 0))
+                c.fill = fill; c.font = Font(name="Arial", size=9)
+                c.alignment = Alignment(horizontal="center"); c.border = tborder()
+            c2 = ws.cell(cur, len(trips) + 2, "YES ✓" if ok else "NO ✗")
+            c2.fill, c2.font = (PASS_FILL, PASS_FONT) if ok else (FAIL_FILL, FAIL_FONT)
+            c2.alignment = Alignment(horizontal="center"); cur += 1
         cur += 1
 
 
-def sheet_readme(wb, nrows, ncols, factor_levels, strength):
-    ws  = wb.create_sheet("README")
-    k   = len(factor_levels)
-    prod = 1
-    for q in factor_levels: prod *= q
-
-    lines = [
-        ("Row-Column Factorial Design — User Guide", True, 14),
-        ("", False, 10),
-        ("WHAT IS THIS DESIGN?", True, 11),
-        ("A row-column factorial design arranges experimental treatments in a two-way "
-         "grid (rows × columns). Each cell holds one run described by a tuple of factor "
-         "levels. The design is constructed so that:", False, 10),
-        ("", False, 10),
-        ("  1. TREATMENT BALANCE: Every possible treatment tuple appears the same number "
-         "of times across the whole array.", False, 10),
-        ("  2. ROW MARGINAL BALANCE: For every factor, each level appears equally often "
-         "in each row.", False, 10),
-        ("  3. COLUMN MARGINAL BALANCE: For every factor, each level appears equally "
-         "often in each column.", False, 10),
-        (f"  4. STRENGTH {strength}: For any {strength} factor positions chosen, every "
-         f"ordered {strength}-tuple of levels appears equally often in each row AND in "
-         "each column.", False, 10),
-        ("", False, 10),
-        ("THIS WORKBOOK", True, 11),
-        (f"  • Design Array    — the full {nrows}×{ncols} array (entries = level tuples)", False, 10),
-        (f"  • Factor 1 … {k}  — separate grid for each factor's level pattern", False, 10),
-        ("  • Verification    — automated PASS/FAIL for every design property", False, 10),
-        ("  • Row Freq Tables — marginal counts per row (should be uniform)", False, 10),
-        ("  • Col Freq Tables — marginal counts per column (should be uniform)", False, 10),
-    ]
-    if strength >= 2:
-        lines += [
-            ("  • Pair Freq (Row) / (Col) — ordered-pair counts (strength-2 check)", False, 10),
-        ]
-    if strength >= 3:
-        lines += [
-            ("  • Triplet Freq (Row) / (Col) — ordered-triplet counts (strength-3 check)", False, 10),
-        ]
-    lines += [
-        ("", False, 10),
-        ("HOW TO CUSTOMISE", True, 11),
-        ("Edit the four CONFIG lines at the top of the Python script:", False, 10),
-        ("  NUM_ROWS       = number of rows", False, 10),
-        ("  NUM_COLS       = number of columns", False, 10),
-        ("  FACTOR_LEVELS  = list of level counts, e.g. [4, 3, 3, 3]", False, 10),
-        ("  TARGET_STRENGTH = 1, 2, or 3", False, 10),
-        ("", False, 10),
-        ("DIVISIBILITY RULE", True, 11),
-        ("For a strength-t design with factor levels q1, q2, …, qk the dimensions "
-         "nrows and ncols must each be divisible by the product of every t or fewer "
-         "of the qi values.", False, 10),
-        (f"For this design ({factor_levels}, strength {strength}) the minimum valid "
-         f"dimension is {minimum_dimension(factor_levels, strength)}.", False, 10),
-        ("", False, 10),
-        ("CONSTRUCTION METHOD", True, 11),
-        ("Generalised cyclic array: cell(i,j)[f] = (i + c_f·j) mod q_f where c_f "
-         "is the smallest integer coprime to q_f. This closed-form formula guarantees "
-         "all balance properties algebraically.", False, 10),
-    ]
-
-    for r_idx, (text, bold, size) in enumerate(lines, 1):
-        c = ws.cell(r_idx, 1, text)
-        c.font = Font(name="Arial", bold=bold, size=size,
-                      color="1F3864" if bold else "000000")
-        ws.row_dimensions[r_idx].height = 16 if text else 8
-    ws.column_dimensions["A"].width = 95
-
-
-# ── Main ─────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
+#  Main
+# ────────────────────────────────────────────────────────────────
 
 def main():
-    nrows = NUM_ROWS
-    ncols = NUM_COLS
-    fl    = FACTOR_LEVELS
-    sth   = TARGET_STRENGTH
+    nrows  = NROWS
+    ncols  = NCOLS
+    fl     = FACTOR_LEVELS
+    sth    = STRENGTH
+    tlimit = TIME_LIMIT
+    k      = len(fl)
 
-    print(f"Row-Column Factorial Design Generator")
-    print(f"  Rows={nrows}, Cols={ncols}, Factors={len(fl)}, "
-          f"Levels={fl}, Strength={sth}")
-    print()
+    logs = []
+    def log(msg):
+        print(msg)
+        logs.append(msg)
 
-    try:
-        check_divisibility(nrows, ncols, fl, sth)
-    except ValueError as e:
-        print(f"Configuration ERROR:\n{e}")
+    log("=" * 60)
+    log("Row-Column Factorial Design — Backtracking Search")
+    log("=" * 60)
+    log(f"  nrows={nrows}, ncols={ncols}")
+    log(f"  factors={k},  levels={fl}")
+    log(f"  strength={sth},  time_limit={tlimit}s")
+    log("")
+
+    # Step 0: feasibility
+    ok, reasons = feasibility_check(nrows, ncols, fl, sth)
+    if not ok:
+        log("INFEASIBLE — divisibility conditions not met:")
+        for r in reasons:
+            log(f"  • {r}")
+        wb = openpyxl.Workbook()
+        write_not_found_workbook(wb, nrows, ncols, fl, sth,
+                                  'infeasible', 0, 0, reasons, 0)
+        wb.save(OUTPUT_FILE)
+        log(f"\nReport saved to {OUTPUT_FILE}")
         return
 
-    array   = build_design(nrows, ncols, fl)
-    results = verify(array, nrows, ncols, fl, sth)
+    # Step 1: generate valid rows
+    log("Step 1: Generating all valid row configurations ...")
+    t0 = time.time()
+    valid_rows = generate_valid_rows(ncols, fl, sth)
+    t1 = time.time()
+    log(f"  → {len(valid_rows)} valid row templates found in {t1-t0:.2f}s")
 
-    print("Verification results:")
-    for key, val in results.items():
-        ok = val[0] if isinstance(val, tuple) else val
-        print(f"  {'✓' if ok else '✗'} {key}")
-    print()
+    if not valid_rows:
+        log("\nNo valid row configurations exist — design cannot be built.")
+        wb = openpyxl.Workbook()
+        write_not_found_workbook(wb, nrows, ncols, fl, sth,
+                                  'not_found', t1-t0, 0, [], 0)
+        wb.save(OUTPUT_FILE)
+        log(f"Report saved to {OUTPUT_FILE}")
+        return
+
+    # Step 2: search
+    log(f"\nStep 2: Backtracking search (time limit: {tlimit}s) ...")
+    solutions, status, elapsed, nodes = search(
+        nrows, ncols, fl, sth, valid_rows, tlimit, FIND_ALL, log)
+
+    log(f"\n  → Status : {status.upper()}")
+    log(f"  → Time   : {elapsed:.3f}s")
+    log(f"  → Nodes  : {nodes:,}")
 
     wb = openpyxl.Workbook()
-    sheet_design(wb, array, nrows, ncols, fl, sth)
-    sheet_factor(wb, array, nrows, ncols, fl)
-    sheet_verification(wb, results, nrows, ncols, fl, sth)
-    sheet_freq(wb, array, nrows, ncols, fl, by="row")
-    sheet_freq(wb, array, nrows, ncols, fl, by="col")
-    if sth >= 2:
-        sheet_pair_freq(wb, array, nrows, ncols, fl, by="row", strength=sth)
-        sheet_pair_freq(wb, array, nrows, ncols, fl, by="col", strength=sth)
-    if sth >= 3:
-        sheet_triplet_freq(wb, array, nrows, ncols, fl, by="row")
-        sheet_triplet_freq(wb, array, nrows, ncols, fl, by="col")
-    sheet_readme(wb, nrows, ncols, fl, sth)
+
+    if solutions:
+        array = solutions[0]
+        log("\nStep 3: Verifying solution independently ...")
+        ver = verify(array, nrows, ncols, fl, sth)
+        all_ok = all(v[0] if isinstance(v, tuple) else v for v in ver.values())
+        for prop, result in ver.items():
+            ok2 = result[0] if isinstance(result, tuple) else result
+            log(f"  {'✓' if ok2 else '✗'} {prop}")
+        log(f"\n  → {'ALL PROPERTIES VERIFIED ✓' if all_ok else 'VERIFICATION FAILED ✗'}")
+        write_found_workbook(wb, array, nrows, ncols, fl, sth,
+                              elapsed, nodes, ver, len(valid_rows))
+    else:
+        write_not_found_workbook(wb, nrows, ncols, fl, sth,
+                                  status, elapsed, nodes, [], len(valid_rows))
 
     wb.save(OUTPUT_FILE)
-    print(f"Saved to: {OUTPUT_FILE}")
+    log(f"\nSaved to {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
